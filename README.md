@@ -204,4 +204,4 @@ The encoder is cross-checked against the canonical [`multibase`](https://crates.
 
 ## License
 
-[MIT](LICENSE).
+[GPLv3](LICENSE).
