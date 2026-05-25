@@ -422,8 +422,9 @@ __kernel void search(
     __global const uchar* cid_lo,           // n_ranges × 40 bytes (prefix mode)
     __global const uchar* cid_hi,           // n_ranges × 40 bytes (prefix mode)
     uint   n_ranges,                        // number of (lo, hi) pairs
-    __global const uchar* needle,           // substring needle
-    uint   needle_len,                      // 0 if none
+    __global const uchar* needle_data,      // concatenated substring needles
+    __global const uint*  needle_lens,      // length of each needle
+    uint   n_needles,                       // number of needles (0 = none)
     __global const uint*  base_table,       // 64×15 affine table entries (3 fe each)
     __global volatile uint* found_flag,
     __global uchar* result_seed,            // 32 bytes
@@ -461,14 +462,24 @@ __kernel void search(
         uchar name62[62];
         name62[0] = 'k';
         cid_to_base36(name62 + 1, cid);
-        if (needle_len > 0 && needle_len <= 62) {
-            for (uint start = 0; start + needle_len <= 62; start++) {
-                int match = 1;
-                for (uint k = 0; k < needle_len; k++) {
-                    if (name62[start + k] != needle[k]) { match = 0; break; }
+
+        // Iterate the concatenated needles; any match wins.
+        uint offset = 0;
+        for (uint nidx = 0; nidx < n_needles && !hit; nidx++) {
+            uint len = needle_lens[nidx];
+            if (len > 0 && len <= 62) {
+                for (uint start = 0; start + len <= 62; start++) {
+                    int match = 1;
+                    for (uint k = 0; k < len; k++) {
+                        if (name62[start + k] != needle_data[offset + k]) {
+                            match = 0;
+                            break;
+                        }
+                    }
+                    if (match) { hit = 1; break; }
                 }
-                if (match) { hit = 1; break; }
             }
+            offset += len;
         }
     }
 

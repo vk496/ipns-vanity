@@ -41,10 +41,12 @@ enum Backend {
         g..m are reachable as the first variable position."
 )]
 struct Args {
-    /// The pattern to search for. Base36 lowercase (0-9, a-z) for prefix and
-    /// substring modes; an arbitrary regex for regex mode. Prefix mode also
-    /// accepts a leading `[abc]` or `[a-z]` character class.
-    pattern: String,
+    /// One or more patterns to search for; a match against any of them counts
+    /// as a hit. Base36 lowercase (0-9, a-z) for prefix and substring modes;
+    /// arbitrary regexes for regex mode. Prefix mode also accepts `[abc]` or
+    /// `[a-z]` character classes at any position inside a pattern.
+    #[arg(required = true, num_args = 1..)]
+    patterns: Vec<String>,
 
     /// Match mode.
     #[arg(short, long, value_enum, default_value_t = Mode::Prefix)]
@@ -77,7 +79,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let matcher = Arc::new(Matcher::new(args.mode, &args.pattern)?);
+    let matcher = Arc::new(Matcher::new(args.mode, &args.patterns)?);
     let stop = Arc::new(AtomicBool::new(false));
     let counter = Arc::new(AtomicU64::new(0));
     let (tx, rx) = unbounded::<Match>();
@@ -108,7 +110,12 @@ fn main() -> Result<()> {
         }
     };
     eprintln!("[ipns-vanity] backend: {chosen:?}");
-    eprintln!("[ipns-vanity] pattern: {} ({:?})", args.pattern, args.mode);
+    eprintln!(
+        "[ipns-vanity] pattern{}: {} ({:?})",
+        if args.patterns.len() == 1 { "" } else { "s" },
+        args.patterns.join(" | "),
+        args.mode,
+    );
 
     // Stats reporter thread.
     let stats_handle = {

@@ -62,8 +62,12 @@ ipns-vanity -m substring beef
 # Regex (CPU only).
 ipns-vanity -m regex '^k51qzi5uqu5dh.*42$'
 
-# Several matches before stopping.
+# Several matches before stopping (default is 3).
 ipns-vanity -n 5 gvk4
+
+# Multiple patterns — any match wins, which multiplies your odds.
+ipns-vanity gvk4 hvi6 jvk2
+ipns-vanity -m substring beef cafe d00d
 ```
 
 ## Pattern modes
@@ -75,6 +79,16 @@ ipns-vanity -n 5 gvk4
 | `regex`      | A regex against the full name (incl. the `k51qzi5uqu5d`)     | CPU only           |
 
 All patterns must use base36 lowercase (digits and `a`–`z`). Regex is unrestricted but only runs on CPU.
+
+### Multiple patterns
+
+You can pass any number of patterns and a match against **any** of them counts as a hit. The kernel tests them all in parallel, so widening the search this way is essentially free and multiplies your effective odds.
+
+```sh
+ipns-vanity gvk4 hvi6 mvk2           # any of the three prefixes
+ipns-vanity -m substring beef cafe    # either substring anywhere
+ipns-vanity -m regex 'aa$' '42$'      # OR-combined into one regex
+```
 
 ### The reachable-alphabet caveat
 

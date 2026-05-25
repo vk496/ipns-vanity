@@ -45,19 +45,41 @@ pub enum Mode {
 }
 
 pub enum Matcher {
-    /// One or more full-prefix variants (e.g. `[gh]abc` expands to two).
+    /// One or more full-prefix variants (e.g. `[gh]abc` expands to two, and
+    /// passing several patterns on the CLI multiplies that further).
     Prefix(Vec<Vec<u8>>),
-    Substring(Box<Finder<'static>>),
+    /// One or more needles, any of which counts as a match.
+    Substring(Substrings),
+    /// A single compiled regex — multiple input patterns are OR-combined into
+    /// it at construction time.
     Regex(Box<Regex>),
 }
 
+/// Substring needles, kept in two parallel forms: precomputed `Finder`s for the
+/// CPU hot loop, and raw bytes for shipping to the GPU.
+pub struct Substrings {
+    finders: Vec<Finder<'static>>,
+    pub needles: Vec<Vec<u8>>,
+}
+
 impl Matcher {
-    pub fn new(mode: Mode, pattern: &str) -> Result<Self> {
+    pub fn new(mode: Mode, patterns: &[String]) -> Result<Self> {
+        if patterns.is_empty() {
+            return Err(anyhow!("at least one pattern is required"));
+        }
         match mode {
             Mode::Prefix => {
-                let variants = expand_pattern(pattern)?;
-                let mut full: Vec<Vec<u8>> = Vec::with_capacity(variants.len());
-                for v in &variants {
+                // Each input may expand into many variants via `[...]` classes;
+                // collect them all, de-duplicate, then filter for reachability.
+                let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+                for pat in patterns {
+                    for v in expand_pattern(pat)? {
+                        all.insert(v);
+                    }
+                }
+
+                let mut full: Vec<Vec<u8>> = Vec::with_capacity(all.len());
+                for v in &all {
                     ensure_base36(v)?;
                     let mut p = Vec::with_capacity(FIXED_PREFIX.len() + v.len());
                     p.extend_from_slice(FIXED_PREFIX);
@@ -65,9 +87,6 @@ impl Matcher {
                     full.push(p);
                 }
 
-                // Keep only the variants that some keypair can actually
-                // produce. If nothing is reachable, surface the most useful
-                // error.
                 let mut reachable: Vec<Vec<u8>> = Vec::new();
                 let mut last_err: Option<anyhow::Error> = None;
                 for p in &full {
@@ -89,13 +108,29 @@ impl Matcher {
                 Ok(Self::Prefix(reachable))
             }
             Mode::Substring => {
-                ensure_base36(pattern)?;
-                Ok(Self::Substring(Box::new(
-                    Finder::new(pattern.as_bytes()).into_owned(),
-                )))
+                let mut needles: Vec<Vec<u8>> = Vec::with_capacity(patterns.len());
+                let mut finders: Vec<Finder<'static>> = Vec::with_capacity(patterns.len());
+                for pat in patterns {
+                    ensure_base36(pat)?;
+                    let bytes = pat.as_bytes().to_vec();
+                    finders.push(Finder::new(bytes.as_slice()).into_owned());
+                    needles.push(bytes);
+                }
+                Ok(Self::Substring(Substrings { finders, needles }))
             }
             Mode::Regex => {
-                let re = Regex::new(pattern).map_err(|e| anyhow!("invalid regex: {e}"))?;
+                // OR-combine: `(?:p1)|(?:p2)|...` so each alternative is
+                // anchored independently.
+                let combined = if patterns.len() == 1 {
+                    patterns[0].clone()
+                } else {
+                    patterns
+                        .iter()
+                        .map(|p| format!("(?:{p})"))
+                        .collect::<Vec<_>>()
+                        .join("|")
+                };
+                let re = Regex::new(&combined).map_err(|e| anyhow!("invalid regex: {e}"))?;
                 Ok(Self::Regex(Box::new(re)))
             }
         }
@@ -105,15 +140,15 @@ impl Matcher {
     pub fn matches(&self, name: &[u8]) -> bool {
         match self {
             Self::Prefix(ps) => ps.iter().any(|p| name.starts_with(p.as_slice())),
-            Self::Substring(f) => f.find(name).is_some(),
+            Self::Substring(s) => s.finders.iter().any(|f| f.find(name).is_some()),
             Self::Regex(re) => re.is_match(name),
         }
     }
 
-    /// Returns the substring needle if this is a substring matcher.
-    pub fn as_substring(&self) -> Option<&[u8]> {
-        if let Self::Substring(f) = self {
-            Some(f.needle())
+    /// Returns the substring needles if this is a substring matcher.
+    pub fn as_substrings(&self) -> Option<&[Vec<u8>]> {
+        if let Self::Substring(s) = self {
+            Some(&s.needles)
         } else {
             None
         }
@@ -322,7 +357,7 @@ mod tests {
     #[test]
     fn matcher_prefix_matches() {
         // 'h' is interior to the reachable g..m range, so any second char is OK.
-        let m = Matcher::new(Mode::Prefix, "h2").unwrap();
+        let m = Matcher::new(Mode::Prefix, &["h2".to_string()]).unwrap();
         let mut name = [b'_'; IPNS_NAME_LEN];
         name[..14].copy_from_slice(b"k51qzi5uqu5dh2");
         assert!(m.matches(&name));
@@ -332,7 +367,7 @@ mod tests {
 
     #[test]
     fn matcher_prefix_char_class_matches_any() {
-        let m = Matcher::new(Mode::Prefix, "[hij]2").unwrap();
+        let m = Matcher::new(Mode::Prefix, &["[hij]2".to_string()]).unwrap();
         for first in [b'h', b'i', b'j'] {
             let mut name = [b'_'; IPNS_NAME_LEN];
             name[..14].copy_from_slice(b"k51qzi5uqu5dh2");
@@ -348,19 +383,21 @@ mod tests {
     #[test]
     fn matcher_prefix_rejects_unreachable() {
         // The variable position can only be g..m, so '1' is impossible.
-        let err = Matcher::new(Mode::Prefix, "1").err().expect("must error");
+        let err = Matcher::new(Mode::Prefix, &["1".to_string()])
+            .err()
+            .expect("must error");
         assert!(err.to_string().contains("not achievable"));
     }
 
     #[test]
     fn matcher_prefix_rejects_non_base36() {
-        assert!(Matcher::new(Mode::Prefix, "g!").is_err());
-        assert!(Matcher::new(Mode::Prefix, "gX").is_err()); // uppercase
+        assert!(Matcher::new(Mode::Prefix, &["g!".to_string()]).is_err());
+        assert!(Matcher::new(Mode::Prefix, &["gX".to_string()]).is_err()); // uppercase
     }
 
     #[test]
     fn matcher_substring_matches_anywhere() {
-        let m = Matcher::new(Mode::Substring, "cafe").unwrap();
+        let m = Matcher::new(Mode::Substring, &["cafe".to_string()]).unwrap();
         let mut name = [b'a'; IPNS_NAME_LEN];
         name[20..24].copy_from_slice(b"cafe");
         assert!(m.matches(&name));
@@ -370,10 +407,57 @@ mod tests {
 
     #[test]
     fn matcher_regex_anchored() {
-        let m = Matcher::new(Mode::Regex, r"^k51.*42$").unwrap();
+        let m = Matcher::new(Mode::Regex, &["^k51.*42$".to_string()]).unwrap();
         let mut name = [b'a'; IPNS_NAME_LEN];
         name[..3].copy_from_slice(b"k51");
         name[60..].copy_from_slice(b"42");
         assert!(m.matches(&name));
+    }
+
+    #[test]
+    fn matcher_prefix_unions_multiple_patterns() {
+        // "h2" and "i3" both produce reachable prefixes; either should hit.
+        let m = Matcher::new(Mode::Prefix, &["h2".to_string(), "i3".to_string()]).unwrap();
+
+        let mut a = [b'_'; IPNS_NAME_LEN];
+        a[..14].copy_from_slice(b"k51qzi5uqu5dh2");
+        assert!(m.matches(&a));
+
+        let mut b = [b'_'; IPNS_NAME_LEN];
+        b[..14].copy_from_slice(b"k51qzi5uqu5di3");
+        assert!(m.matches(&b));
+
+        // A name that matches neither.
+        let mut c = [b'_'; IPNS_NAME_LEN];
+        c[..14].copy_from_slice(b"k51qzi5uqu5dh3");
+        assert!(!m.matches(&c));
+    }
+
+    #[test]
+    fn matcher_substring_unions_multiple_needles() {
+        let m = Matcher::new(Mode::Substring, &["beef".to_string(), "cafe".to_string()]).unwrap();
+        let mut a = [b'x'; IPNS_NAME_LEN];
+        a[10..14].copy_from_slice(b"beef");
+        assert!(m.matches(&a));
+
+        let mut b = [b'x'; IPNS_NAME_LEN];
+        b[40..44].copy_from_slice(b"cafe");
+        assert!(m.matches(&b));
+
+        let c = [b'x'; IPNS_NAME_LEN];
+        assert!(!m.matches(&c));
+    }
+
+    #[test]
+    fn matcher_regex_ors_multiple_patterns() {
+        let m = Matcher::new(
+            Mode::Regex,
+            &["^k51.*xx$".to_string(), "^k51.*42$".to_string()],
+        )
+        .unwrap();
+        let mut a = [b'q'; IPNS_NAME_LEN];
+        a[..3].copy_from_slice(b"k51");
+        a[60..].copy_from_slice(b"42");
+        assert!(m.matches(&a));
     }
 }

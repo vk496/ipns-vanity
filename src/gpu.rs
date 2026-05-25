@@ -106,8 +106,12 @@ pub fn run(
     // a tens-of-ms at startup — negligible compared to the search itself.
     let base_table_limbs = curve_constants();
 
-    // mode 0 = prefix (one or more ranges OR'd), mode 1 = substring.
-    let (mode_code, cid_lo, cid_hi, needle, n_ranges) = match &*matcher {
+    // mode 0 = prefix (one or more CID ranges OR'd),
+    // mode 1 = substring (one or more needles OR'd).
+    //
+    // The kernel receives concatenated needles in `needle_data` plus a
+    // parallel `needle_lens` array; for prefix mode those buffers stay empty.
+    let (mode_code, cid_lo, cid_hi, needle_data, needle_lens, n_ranges) = match &*matcher {
         Matcher::Prefix(ps) => {
             let mut lo_all = Vec::with_capacity(ps.len() * 40);
             let mut hi_all = Vec::with_capacity(ps.len() * 40);
@@ -116,14 +120,34 @@ pub fn run(
                 lo_all.extend_from_slice(&lo);
                 hi_all.extend_from_slice(&hi);
             }
-            (0u32, lo_all, hi_all, Vec::new(), ps.len() as u32)
+            (
+                0u32,
+                lo_all,
+                hi_all,
+                Vec::new(),
+                Vec::new(),
+                ps.len() as u32,
+            )
         }
         Matcher::Substring(_) => {
-            let needle = matcher.as_substring().unwrap().to_vec();
-            if needle.is_empty() || needle.len() > 62 {
-                bail!("substring length must be between 1 and 62 base36 chars");
+            let needles = matcher.as_substrings().unwrap();
+            let mut data = Vec::new();
+            let mut lens: Vec<u32> = Vec::with_capacity(needles.len());
+            for n in needles {
+                if n.is_empty() || n.len() > 62 {
+                    bail!("each substring needle must be between 1 and 62 base36 chars");
+                }
+                data.extend_from_slice(n);
+                lens.push(n.len() as u32);
             }
-            (1u32, vec![0u8; 40], vec![0u8; 40], needle, 0u32)
+            (
+                1u32,
+                vec![0u8; 40],
+                vec![0u8; 40],
+                data,
+                lens,
+                needles.len() as u32,
+            )
         }
         Matcher::Regex(_) => {
             bail!("regex mode is not supported by the GPU backend; rerun with --backend cpu");
@@ -150,18 +174,30 @@ pub fn run(
         .len(cid_hi.len())
         .copy_host_slice(&cid_hi)
         .build()?;
-    // Substring needle: always at least 1 byte so OpenCL is happy.
-    let needle_storage: Vec<u8> = if needle.is_empty() {
+    // Needle buffers: OpenCL needs at least 1 byte each.
+    let needle_data_storage: Vec<u8> = if needle_data.is_empty() {
         vec![0u8]
     } else {
-        needle.clone()
+        needle_data.clone()
     };
-    let needle_buf = Buffer::<u8>::builder()
+    let needle_lens_storage: Vec<u32> = if needle_lens.is_empty() {
+        vec![0u32]
+    } else {
+        needle_lens.clone()
+    };
+    let needle_data_buf = Buffer::<u8>::builder()
         .queue(queue.clone())
         .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
-        .len(needle_storage.len())
-        .copy_host_slice(&needle_storage)
+        .len(needle_data_storage.len())
+        .copy_host_slice(&needle_data_storage)
         .build()?;
+    let needle_lens_buf = Buffer::<u32>::builder()
+        .queue(queue.clone())
+        .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
+        .len(needle_lens_storage.len())
+        .copy_host_slice(&needle_lens_storage)
+        .build()?;
+    let n_needles = needle_lens.len() as u32;
     let base_table_buf = Buffer::<u32>::builder()
         .queue(queue.clone())
         .flags(flags::MEM_READ_ONLY | flags::MEM_COPY_HOST_PTR)
@@ -193,12 +229,13 @@ pub fn run(
         .arg(&cid_lo_buf) // 3  cid_lo (concat of n_ranges × 40 bytes)
         .arg(&cid_hi_buf) // 4  cid_hi
         .arg(n_ranges) // 5  n_ranges
-        .arg(&needle_buf) // 6
-        .arg(needle.len() as u32) // 7  needle_len
-        .arg(&base_table_buf) // 8  4-bit windowed affine table
-        .arg(&found_flag_buf) // 9
-        .arg(&result_seed_buf) // 10
-        .arg(&result_pubkey_buf) // 11
+        .arg(&needle_data_buf) // 6  concatenated substring needles
+        .arg(&needle_lens_buf) // 7  per-needle lengths
+        .arg(n_needles) // 8  number of needles
+        .arg(&base_table_buf) // 9  4-bit windowed affine table
+        .arg(&found_flag_buf) // 10
+        .arg(&result_seed_buf) // 11
+        .arg(&result_pubkey_buf) // 12
         .global_work_size(global_size)
         .build()?;
 
@@ -262,10 +299,10 @@ pub fn run(
         // for every work item. Without this the first found match would let
         // later work items bail early and skew the timing.
         kernel.set_arg(2, 1u32)?; // mode = substring
-        kernel.set_arg(7, 0u32)?; // needle_len = 0 → no hit
+        kernel.set_arg(8, 0u32)?; // n_needles = 0 → no hit
         batch = calibrate(&mut kernel, &mut do_dispatch, batch)?;
         kernel.set_arg(2, mode_code)?;
-        kernel.set_arg(7, needle.len() as u32)?;
+        kernel.set_arg(8, n_needles)?;
     }
     kernel.set_default_global_work_size(SpatialDims::One(batch));
 
