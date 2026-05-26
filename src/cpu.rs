@@ -11,6 +11,7 @@ use rayon::prelude::*;
 
 use crate::ipns::{IPNS_NAME_LEN, write_ipns_name};
 use crate::matcher::Matcher;
+use crate::peerid::{PEER_ID_LEN, peer_id};
 
 /// One vanity match produced by either backend.
 #[derive(Clone)]
@@ -53,6 +54,8 @@ fn worker(matcher: &Matcher, stop: &AtomicBool, counter: &AtomicU64, tx: &Sender
     let mut rng = ChaCha20Rng::from_entropy();
     let mut seed = [0u8; 32];
     let mut name = [0u8; IPNS_NAME_LEN];
+    let mut peer = [0u8; PEER_ID_LEN];
+    let needs_peer = matcher.needs_peer_id();
 
     // Tally locally and flush in batches to keep the shared atomic out of
     // the hot loop.
@@ -65,8 +68,11 @@ fn worker(matcher: &Matcher, stop: &AtomicBool, counter: &AtomicU64, tx: &Sender
         let pubkey = signing_key.verifying_key().to_bytes();
 
         write_ipns_name(&pubkey, &mut name);
+        if needs_peer {
+            peer = peer_id(&pubkey);
+        }
 
-        if matcher.matches(&name) {
+        if matcher.matches(&name, &peer) {
             let _ = tx.send(Match { seed, pubkey, name });
         }
 

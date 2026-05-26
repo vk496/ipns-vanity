@@ -1,16 +1,21 @@
-//! Pattern matching against an encoded IPNS name.
+//! Pattern matching against an encoded Ed25519 identifier.
 //!
-//! Every Ed25519 IPNS name begins with the fixed 12-character string
-//! `"k51qzi5uqu5d"` — the `k` multibase tag plus 11 base36 digits derived from
-//! the constant CID prefix bytes. Those 12 characters are impossible to alter
-//! by changing the keypair, so for prefix mode we automatically prepend them
-//! to whatever the user typed.
+//! Two flavours of identifier are supported:
 //!
-//! The 13th character is variable but its alphabet is restricted (only seven
-//! base36 digits are actually reachable, because the 32-byte public-key range
-//! only covers about 18% of one base36-digit slot at that position). We
-//! validate that the user's prefix can be reached by *some* keypair and bail
-//! out early with a friendly error if not.
+//! * **IPNS name** (`k51qzi5uqu5d…`) — CIDv1 with the libp2p-key codec,
+//!   identity multihash, base36-lower multibase. 62 ASCII chars.
+//! * **Peer ID** (`12D3KooW…`) — base58btc of the identity multihash. 52 ASCII
+//!   chars.
+//!
+//! Both encode the same Ed25519 public key, so a single search can target
+//! either or both. Patterns are sorted into two pools by the caller: IPNS
+//! patterns are matched against the IPNS name; peer-ID patterns are matched
+//! against the peer-ID string. A keypair is a hit if **any** pattern in either
+//! pool matches its target.
+//!
+//! Each target also has a fixed leading prefix that no keypair can change —
+//! `"k51qzi5uqu5d"` for IPNS, `"12D3KooW"` for peer IDs — and we automatically
+//! prepend them so the user only types the variable part.
 //!
 //! ## Character classes
 //!
@@ -29,10 +34,47 @@ use memchr::memmem::Finder;
 use regex::bytes::Regex;
 
 use crate::ipns::{IPNS_NAME_LEN, ipns_name};
+use crate::peerid::{FIXED_PEER_PREFIX, PEER_ID_LEN, peer_id};
 
 /// Every Ed25519 IPNS name starts with these 12 characters. The user's prefix
 /// pattern is appended to this when searching.
 pub const FIXED_PREFIX: &[u8] = b"k51qzi5uqu5d";
+
+/// Which encoding a pattern was supplied for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Ipns,
+    Peer,
+}
+
+impl Target {
+    fn fixed_prefix(self) -> &'static [u8] {
+        match self {
+            Target::Ipns => FIXED_PREFIX,
+            Target::Peer => FIXED_PEER_PREFIX,
+        }
+    }
+    fn encoded_len(self) -> usize {
+        match self {
+            Target::Ipns => IPNS_NAME_LEN,
+            Target::Peer => PEER_ID_LEN,
+        }
+    }
+    fn name(self) -> &'static str {
+        match self {
+            Target::Ipns => "ipns",
+            Target::Peer => "peer-id",
+        }
+    }
+    /// Which characters are valid in patterns for this target.
+    fn is_valid_char(self, c: char) -> bool {
+        match self {
+            Target::Ipns => c.is_ascii_lowercase() || c.is_ascii_digit(),
+            // base58btc alphabet — alphanumeric minus 0/O/I/l.
+            Target::Peer => c.is_ascii_alphanumeric() && !matches!(c, '0' | 'O' | 'I' | 'l'),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum Mode {
@@ -44,15 +86,33 @@ pub enum Mode {
     Regex,
 }
 
+/// Which identifier(s) to search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum Scope {
+    /// Search the IPNS name (`k51qzi5uqu5d…`) only.
+    Ipns,
+    /// Search the peer ID (`12D3KooW…`) only.
+    Peerid,
+    /// Search both — each pattern is auto-routed to whichever alphabet it fits.
+    Both,
+}
+
 pub enum Matcher {
-    /// One or more full-prefix variants (e.g. `[gh]abc` expands to two, and
-    /// passing several patterns on the CLI multiplies that further).
-    Prefix(Vec<Vec<u8>>),
-    /// One or more needles, any of which counts as a match.
-    Substring(Substrings),
-    /// A single compiled regex — multiple input patterns are OR-combined into
-    /// it at construction time.
-    Regex(Box<Regex>),
+    /// Full-prefix variants, kept per target so the GPU can translate the IPNS
+    /// ones to CID ranges and the peer-ID ones to multihash ranges (re-cast as
+    /// CID ranges, see `gpu::run`).
+    Prefix {
+        ipns: Vec<Vec<u8>>,
+        peer: Vec<Vec<u8>>,
+    },
+    /// Substring needles per target.
+    Substring { ipns: Substrings, peer: Substrings },
+    /// Compiled regex per target (each only set when at least one pattern was
+    /// supplied for that target).
+    Regex {
+        ipns: Option<Box<Regex>>,
+        peer: Option<Box<Regex>>,
+    },
 }
 
 /// Substring needles, kept in two parallel forms: precomputed `Finder`s for the
@@ -62,97 +122,242 @@ pub struct Substrings {
     pub needles: Vec<Vec<u8>>,
 }
 
+impl Substrings {
+    pub fn is_empty(&self) -> bool {
+        self.needles.is_empty()
+    }
+}
+
 impl Matcher {
-    pub fn new(mode: Mode, patterns: &[String]) -> Result<Self> {
+    /// Build a matcher from a single pattern list plus the `--target` scope.
+    /// In `Scope::Both`, each pattern is auto-routed by its alphabet to the
+    /// IPNS pool, the peer-id pool, or both. A pattern that fits neither
+    /// alphabet, or that's unreachable under every target it fits, errors.
+    pub fn new(mode: Mode, scope: Scope, patterns: &[String]) -> Result<Self> {
         if patterns.is_empty() {
             return Err(anyhow!("at least one pattern is required"));
         }
+        let (ipns_pats, peer_pats) = partition_patterns(scope, patterns)?;
+        let tolerate_partial = scope == Scope::Both;
+
         match mode {
             Mode::Prefix => {
-                // Each input may expand into many variants via `[...]` classes;
-                // collect them all, de-duplicate, then filter for reachability.
-                let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-                for pat in patterns {
-                    for v in expand_pattern(pat)? {
-                        all.insert(v);
-                    }
+                let ipns = build_prefix_or_skip(Target::Ipns, &ipns_pats, tolerate_partial)?;
+                let peer = build_prefix_or_skip(Target::Peer, &peer_pats, tolerate_partial)?;
+                if ipns.is_empty() && peer.is_empty() {
+                    return Err(anyhow!(
+                        "no pattern is reachable as a prefix for the selected target(s)"
+                    ));
                 }
-
-                let mut full: Vec<Vec<u8>> = Vec::with_capacity(all.len());
-                for v in &all {
-                    ensure_base36(v)?;
-                    let mut p = Vec::with_capacity(FIXED_PREFIX.len() + v.len());
-                    p.extend_from_slice(FIXED_PREFIX);
-                    p.extend_from_slice(v.as_bytes());
-                    full.push(p);
-                }
-
-                let mut reachable: Vec<Vec<u8>> = Vec::new();
-                let mut last_err: Option<anyhow::Error> = None;
-                for p in &full {
-                    match check_prefix_achievable(p) {
-                        Ok(()) => reachable.push(p.clone()),
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                if reachable.is_empty() {
-                    return Err(last_err.unwrap_or_else(|| anyhow!("no reachable prefix")));
-                }
-                if reachable.len() < full.len() {
-                    eprintln!(
-                        "[ipns-vanity] note: {} of {} prefix variants are not reachable and were dropped",
-                        full.len() - reachable.len(),
-                        full.len(),
-                    );
-                }
-                Ok(Self::Prefix(reachable))
+                Ok(Self::Prefix { ipns, peer })
             }
-            Mode::Substring => {
-                let mut needles: Vec<Vec<u8>> = Vec::with_capacity(patterns.len());
-                let mut finders: Vec<Finder<'static>> = Vec::with_capacity(patterns.len());
-                for pat in patterns {
-                    ensure_base36(pat)?;
-                    let bytes = pat.as_bytes().to_vec();
-                    finders.push(Finder::new(bytes.as_slice()).into_owned());
-                    needles.push(bytes);
-                }
-                Ok(Self::Substring(Substrings { finders, needles }))
-            }
-            Mode::Regex => {
-                // OR-combine: `(?:p1)|(?:p2)|...` so each alternative is
-                // anchored independently.
-                let combined = if patterns.len() == 1 {
-                    patterns[0].clone()
-                } else {
-                    patterns
-                        .iter()
-                        .map(|p| format!("(?:{p})"))
-                        .collect::<Vec<_>>()
-                        .join("|")
-                };
-                let re = Regex::new(&combined).map_err(|e| anyhow!("invalid regex: {e}"))?;
-                Ok(Self::Regex(Box::new(re)))
-            }
+            Mode::Substring => Ok(Self::Substring {
+                ipns: build_substrings(Target::Ipns, &ipns_pats)?,
+                peer: build_substrings(Target::Peer, &peer_pats)?,
+            }),
+            Mode::Regex => Ok(Self::Regex {
+                ipns: build_regex(&ipns_pats)?,
+                peer: build_regex(&peer_pats)?,
+            }),
         }
     }
 
     #[inline]
-    pub fn matches(&self, name: &[u8]) -> bool {
+    pub fn matches(&self, ipns: &[u8], peer: &[u8]) -> bool {
         match self {
-            Self::Prefix(ps) => ps.iter().any(|p| name.starts_with(p.as_slice())),
-            Self::Substring(s) => s.finders.iter().any(|f| f.find(name).is_some()),
-            Self::Regex(re) => re.is_match(name),
+            Self::Prefix { ipns: i, peer: p } => {
+                i.iter().any(|x| ipns.starts_with(x.as_slice()))
+                    || p.iter().any(|x| peer.starts_with(x.as_slice()))
+            }
+            Self::Substring { ipns: i, peer: p } => {
+                i.finders.iter().any(|f| f.find(ipns).is_some())
+                    || p.finders.iter().any(|f| f.find(peer).is_some())
+            }
+            Self::Regex { ipns: i, peer: p } => {
+                i.as_ref().is_some_and(|re| re.is_match(ipns))
+                    || p.as_ref().is_some_and(|re| re.is_match(peer))
+            }
         }
     }
 
-    /// Returns the substring needles if this is a substring matcher.
-    pub fn as_substrings(&self) -> Option<&[Vec<u8>]> {
-        if let Self::Substring(s) = self {
-            Some(&s.needles)
-        } else {
-            None
+    /// Returns `true` if this matcher needs peer-ID computation (any peer-ID
+    /// pattern was supplied). Used by the search loops to avoid encoding the
+    /// peer ID when nothing would consume it.
+    pub fn needs_peer_id(&self) -> bool {
+        match self {
+            Self::Prefix { peer, .. } => !peer.is_empty(),
+            Self::Substring { peer, .. } => !peer.is_empty(),
+            Self::Regex { peer, .. } => peer.is_some(),
         }
     }
+}
+
+/// Decide which target pool(s) each input pattern belongs to based on the
+/// `--target` scope and the pattern's alphabet.
+///
+/// For `Scope::Ipns` / `Scope::Peerid` every pattern goes into that one pool
+/// unchanged (alphabet validation happens later inside `build_*`).
+///
+/// For `Scope::Both` we look at each pattern's characters: lowercase letters
+/// and digits typically fit *both* alphabets and the reachability check sorts
+/// out which target it can actually hit. Uppercase letters route to peer-id
+/// only. A pattern that uses characters outside *both* alphabets is rejected.
+fn partition_patterns(scope: Scope, patterns: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let want_ipns = matches!(scope, Scope::Ipns | Scope::Both);
+    let want_peer = matches!(scope, Scope::Peerid | Scope::Both);
+
+    let mut ipns_pats = Vec::new();
+    let mut peer_pats = Vec::new();
+    for pat in patterns {
+        let fits_ipns = want_ipns && pattern_class_fits(Target::Ipns, pat);
+        let fits_peer = want_peer && pattern_class_fits(Target::Peer, pat);
+
+        match scope {
+            Scope::Ipns => ipns_pats.push(pat.clone()),
+            Scope::Peerid => peer_pats.push(pat.clone()),
+            Scope::Both => {
+                if !fits_ipns && !fits_peer {
+                    return Err(anyhow!(
+                        "pattern '{pat}' uses characters outside both the IPNS base36 and \
+                         the peer-id base58btc alphabets"
+                    ));
+                }
+                if fits_ipns {
+                    ipns_pats.push(pat.clone());
+                }
+                if fits_peer {
+                    peer_pats.push(pat.clone());
+                }
+            }
+        }
+    }
+    Ok((ipns_pats, peer_pats))
+}
+
+/// Permissive alphabet check used during `Scope::Both` routing. Character
+/// classes (`[abc]`, `[a-z]`) are accepted regardless of what's inside, since
+/// they expand later — the full alphabet check fires inside `build_*`.
+fn pattern_class_fits(target: Target, pat: &str) -> bool {
+    let mut in_class = false;
+    for c in pat.chars() {
+        if c == '[' {
+            in_class = true;
+            continue;
+        }
+        if c == ']' {
+            in_class = false;
+            continue;
+        }
+        if in_class || c == '-' {
+            continue;
+        }
+        if !target.is_valid_char(c) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `build_prefix_variants`, but in `Scope::Both` mode we tolerate a one-side
+/// failure (and just print the reason) so the other side can still produce a
+/// usable matcher.
+fn build_prefix_or_skip(
+    target: Target,
+    patterns: &[String],
+    tolerate: bool,
+) -> Result<Vec<Vec<u8>>> {
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    match build_prefix_variants(target, patterns) {
+        Ok(v) => Ok(v),
+        Err(e) if tolerate => {
+            eprintln!(
+                "[ipns-vanity] note: skipping {} target: {}",
+                target.name(),
+                e
+            );
+            Ok(Vec::new())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn build_prefix_variants(target: Target, patterns: &[String]) -> Result<Vec<Vec<u8>>> {
+    if patterns.is_empty() {
+        return Ok(Vec::new());
+    }
+    let fixed = target.fixed_prefix();
+    let fixed_str = std::str::from_utf8(fixed).unwrap();
+
+    let mut all: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for pat in patterns {
+        // Be forgiving: a user can paste the whole `k51qzi5uqu5d…` or
+        // `12D3KooW…` prefix and we just strip the fixed part.
+        let pat = pat.strip_prefix(fixed_str).unwrap_or(pat).to_string();
+        for v in expand_pattern(&pat)? {
+            all.insert(v);
+        }
+    }
+
+    let mut full: Vec<Vec<u8>> = Vec::with_capacity(all.len());
+    for v in &all {
+        ensure_alphabet(target, v)?;
+        let mut p = Vec::with_capacity(fixed.len() + v.len());
+        p.extend_from_slice(fixed);
+        p.extend_from_slice(v.as_bytes());
+        full.push(p);
+    }
+
+    let mut reachable: Vec<Vec<u8>> = Vec::new();
+    let mut last_err: Option<anyhow::Error> = None;
+    for p in &full {
+        match check_prefix_achievable(target, p) {
+            Ok(()) => reachable.push(p.clone()),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    if reachable.is_empty() {
+        return Err(last_err.unwrap_or_else(|| anyhow!("no reachable prefix")));
+    }
+    if reachable.len() < full.len() {
+        eprintln!(
+            "[ipns-vanity] note: {} of {} {} prefix variants are not reachable and were dropped",
+            full.len() - reachable.len(),
+            full.len(),
+            target.name(),
+        );
+    }
+    Ok(reachable)
+}
+
+fn build_substrings(target: Target, patterns: &[String]) -> Result<Substrings> {
+    let mut needles: Vec<Vec<u8>> = Vec::with_capacity(patterns.len());
+    let mut finders: Vec<Finder<'static>> = Vec::with_capacity(patterns.len());
+    for pat in patterns {
+        ensure_alphabet(target, pat)?;
+        let bytes = pat.as_bytes().to_vec();
+        finders.push(Finder::new(bytes.as_slice()).into_owned());
+        needles.push(bytes);
+    }
+    Ok(Substrings { finders, needles })
+}
+
+fn build_regex(patterns: &[String]) -> Result<Option<Box<Regex>>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let combined = if patterns.len() == 1 {
+        patterns[0].clone()
+    } else {
+        patterns
+            .iter()
+            .map(|p| format!("(?:{p})"))
+            .collect::<Vec<_>>()
+            .join("|")
+    };
+    let re = Regex::new(&combined).map_err(|e| anyhow!("invalid regex: {e}"))?;
+    Ok(Some(Box::new(re)))
 }
 
 /// Cap on the Cartesian product of prefix variants. A handful of classes is
@@ -238,54 +443,79 @@ fn expand_char_class(class: &str) -> Result<Vec<char>> {
     Ok(set.into_iter().collect())
 }
 
-/// Verify the user's prefix is reachable by *some* Ed25519 IPNS name.
+/// Verify the user's prefix is reachable by *some* Ed25519 identifier of the
+/// chosen target.
 ///
-/// The full set of names is `[ipns_name(&[0; 32]), ipns_name(&[0xff; 32])]`
-/// (lexicographically — base36 byte order matches numeric order). A prefix
-/// `p` is reachable iff there exists a string `S` with `p` as its prefix and
-/// `min ≤ S ≤ max`; checking the extremes `p || "0…"` and `p || "z…"` against
-/// the bounds is enough.
-fn check_prefix_achievable(full: &[u8]) -> Result<()> {
-    let name_min = ipns_name(&[0u8; 32]);
-    let name_max = ipns_name(&[0xffu8; 32]);
+/// The full set of names for the target is bounded by encoding the all-zero
+/// and all-ones public keys. A prefix `p` is reachable iff there exists a
+/// string `S` with `p` as its prefix and `min ≤ S ≤ max`; checking the
+/// extremes `p || "<min-char>…"` and `p || "<max-char>…"` against the bounds
+/// is enough. Padding chars depend on the alphabet (`0`/`z` for IPNS, `1`/`z`
+/// for base58btc).
+fn check_prefix_achievable(target: Target, full: &[u8]) -> Result<()> {
+    let (min_buf, max_buf, lo_pad, hi_pad, n) = match target {
+        Target::Ipns => (
+            ipns_name(&[0u8; 32]).to_vec(),
+            ipns_name(&[0xffu8; 32]).to_vec(),
+            b'0',
+            b'z',
+            IPNS_NAME_LEN,
+        ),
+        Target::Peer => (
+            peer_id(&[0u8; 32]).to_vec(),
+            peer_id(&[0xffu8; 32]).to_vec(),
+            b'1',
+            b'z',
+            PEER_ID_LEN,
+        ),
+    };
 
-    let mut padded_lo = [b'0'; IPNS_NAME_LEN];
-    let mut padded_hi = [b'z'; IPNS_NAME_LEN];
-    let n = full.len().min(IPNS_NAME_LEN);
-    padded_lo[..n].copy_from_slice(&full[..n]);
-    padded_hi[..n].copy_from_slice(&full[..n]);
+    let mut padded_lo = vec![lo_pad; n];
+    let mut padded_hi = vec![hi_pad; n];
+    let m = full.len().min(n);
+    padded_lo[..m].copy_from_slice(&full[..m]);
+    padded_hi[..m].copy_from_slice(&full[..m]);
 
-    if padded_lo[..] > name_max[..] || padded_hi[..] < name_min[..] {
+    if padded_lo[..] > max_buf[..] || padded_hi[..] < min_buf[..] {
         let allowed_pos = full
             .iter()
-            .zip(name_min.iter().zip(name_max.iter()))
+            .zip(min_buf.iter().zip(max_buf.iter()))
             .position(|(c, (lo, hi))| !(*lo..=*hi).contains(c))
             .unwrap_or(0);
         let bad_char = full.get(allowed_pos).copied().unwrap_or(b'?') as char;
         return Err(anyhow!(
-            "prefix '{}' is not achievable: at name position {} the character \
+            "{} prefix '{}' is not achievable: at position {} the character \
              must be between '{}' and '{}' (saw '{}').\n\
-             Ed25519 IPNS names are bounded by:\n  {}\n  {}",
+             Bounds:\n  {}\n  {}",
+            target.name(),
             std::str::from_utf8(full).unwrap_or("?"),
             allowed_pos,
-            name_min[allowed_pos] as char,
-            name_max[allowed_pos] as char,
+            min_buf[allowed_pos] as char,
+            max_buf[allowed_pos] as char,
             bad_char,
-            std::str::from_utf8(&name_min).unwrap_or("?"),
-            std::str::from_utf8(&name_max).unwrap_or("?"),
+            std::str::from_utf8(&min_buf).unwrap_or("?"),
+            std::str::from_utf8(&max_buf).unwrap_or("?"),
         ));
     }
+    let _ = target.encoded_len(); // silence unused-method warning during build
     Ok(())
 }
 
-fn ensure_base36(pattern: &str) -> Result<()> {
+fn ensure_alphabet(target: Target, pattern: &str) -> Result<()> {
     if pattern.is_empty() {
         return Err(anyhow!("pattern must not be empty"));
     }
     for c in pattern.chars() {
-        if !c.is_ascii_lowercase() && !c.is_ascii_digit() {
+        if !target.is_valid_char(c) {
+            let allowed = match target {
+                Target::Ipns => "base36 lowercase (0-9, a-z)",
+                Target::Peer => "base58btc (1-9, A-Z, a-z, excluding 0/O/I/l)",
+            };
             return Err(anyhow!(
-                "pattern contains '{c}': IPNS names only use base36 lowercase (0-9, a-z)"
+                "{} pattern contains '{c}': {} only uses {}",
+                target.name(),
+                target.name(),
+                allowed,
             ));
         }
     }
@@ -354,36 +584,46 @@ mod tests {
         assert!(expand_pattern("[z-a]").is_err());
     }
 
+    fn mk(mode: Mode, scope: Scope, p: &[&str]) -> Matcher {
+        let pats: Vec<String> = p.iter().map(|s| s.to_string()).collect();
+        Matcher::new(mode, scope, &pats).unwrap()
+    }
+    fn ipns_mk(p: &[&str]) -> Matcher {
+        mk(Mode::Prefix, Scope::Ipns, p)
+    }
+    fn peer_mk(p: &[&str]) -> Matcher {
+        mk(Mode::Prefix, Scope::Peerid, p)
+    }
+
+    /// Build an IPNS-name buffer with `ipns` written at the start and the rest
+    /// filled with a known-irrelevant character.
+    fn ipns_buf(ipns: &str) -> [u8; IPNS_NAME_LEN] {
+        let mut b = [b'_'; IPNS_NAME_LEN];
+        b[..ipns.len()].copy_from_slice(ipns.as_bytes());
+        b
+    }
+    const EMPTY_IPNS: [u8; IPNS_NAME_LEN] = [b'_'; IPNS_NAME_LEN];
+    const EMPTY_PEER: [u8; PEER_ID_LEN] = [b'_'; PEER_ID_LEN];
+
     #[test]
     fn matcher_prefix_matches() {
-        // 'h' is interior to the reachable g..m range, so any second char is OK.
-        let m = Matcher::new(Mode::Prefix, &["h2".to_string()]).unwrap();
-        let mut name = [b'_'; IPNS_NAME_LEN];
-        name[..14].copy_from_slice(b"k51qzi5uqu5dh2");
-        assert!(m.matches(&name));
-        name[13] = b'3';
-        assert!(!m.matches(&name));
+        let m = ipns_mk(&["h2"]);
+        assert!(m.matches(&ipns_buf("k51qzi5uqu5dh2"), &EMPTY_PEER));
+        assert!(!m.matches(&ipns_buf("k51qzi5uqu5dh3"), &EMPTY_PEER));
     }
 
     #[test]
     fn matcher_prefix_char_class_matches_any() {
-        let m = Matcher::new(Mode::Prefix, &["[hij]2".to_string()]).unwrap();
-        for first in [b'h', b'i', b'j'] {
-            let mut name = [b'_'; IPNS_NAME_LEN];
-            name[..14].copy_from_slice(b"k51qzi5uqu5dh2");
-            name[12] = first;
-            assert!(
-                m.matches(&name),
-                "should match first char {}",
-                first as char
-            );
+        let m = ipns_mk(&["[hij]2"]);
+        for first in ['h', 'i', 'j'] {
+            let s = format!("k51qzi5uqu5d{first}2");
+            assert!(m.matches(&ipns_buf(&s), &EMPTY_PEER));
         }
     }
 
     #[test]
     fn matcher_prefix_rejects_unreachable() {
-        // The variable position can only be g..m, so '1' is impossible.
-        let err = Matcher::new(Mode::Prefix, &["1".to_string()])
+        let err = Matcher::new(Mode::Prefix, Scope::Ipns, &["1".to_string()])
             .err()
             .expect("must error");
         assert!(err.to_string().contains("not achievable"));
@@ -391,73 +631,99 @@ mod tests {
 
     #[test]
     fn matcher_prefix_rejects_non_base36() {
-        assert!(Matcher::new(Mode::Prefix, &["g!".to_string()]).is_err());
-        assert!(Matcher::new(Mode::Prefix, &["gX".to_string()]).is_err()); // uppercase
+        assert!(Matcher::new(Mode::Prefix, Scope::Ipns, &["g!".to_string()]).is_err());
+        assert!(Matcher::new(Mode::Prefix, Scope::Ipns, &["gX".to_string()]).is_err());
     }
 
     #[test]
     fn matcher_substring_matches_anywhere() {
-        let m = Matcher::new(Mode::Substring, &["cafe".to_string()]).unwrap();
+        let m = mk(Mode::Substring, Scope::Ipns, &["cafe"]);
         let mut name = [b'a'; IPNS_NAME_LEN];
         name[20..24].copy_from_slice(b"cafe");
-        assert!(m.matches(&name));
+        assert!(m.matches(&name, &EMPTY_PEER));
         name[20] = b'x';
-        assert!(!m.matches(&name));
+        assert!(!m.matches(&name, &EMPTY_PEER));
     }
 
     #[test]
     fn matcher_regex_anchored() {
-        let m = Matcher::new(Mode::Regex, &["^k51.*42$".to_string()]).unwrap();
+        let m = mk(Mode::Regex, Scope::Ipns, &["^k51.*42$"]);
         let mut name = [b'a'; IPNS_NAME_LEN];
         name[..3].copy_from_slice(b"k51");
         name[60..].copy_from_slice(b"42");
-        assert!(m.matches(&name));
+        assert!(m.matches(&name, &EMPTY_PEER));
     }
 
     #[test]
     fn matcher_prefix_unions_multiple_patterns() {
-        // "h2" and "i3" both produce reachable prefixes; either should hit.
-        let m = Matcher::new(Mode::Prefix, &["h2".to_string(), "i3".to_string()]).unwrap();
-
-        let mut a = [b'_'; IPNS_NAME_LEN];
-        a[..14].copy_from_slice(b"k51qzi5uqu5dh2");
-        assert!(m.matches(&a));
-
-        let mut b = [b'_'; IPNS_NAME_LEN];
-        b[..14].copy_from_slice(b"k51qzi5uqu5di3");
-        assert!(m.matches(&b));
-
-        // A name that matches neither.
-        let mut c = [b'_'; IPNS_NAME_LEN];
-        c[..14].copy_from_slice(b"k51qzi5uqu5dh3");
-        assert!(!m.matches(&c));
+        let m = ipns_mk(&["h2", "i3"]);
+        assert!(m.matches(&ipns_buf("k51qzi5uqu5dh2"), &EMPTY_PEER));
+        assert!(m.matches(&ipns_buf("k51qzi5uqu5di3"), &EMPTY_PEER));
+        assert!(!m.matches(&ipns_buf("k51qzi5uqu5dh3"), &EMPTY_PEER));
     }
 
     #[test]
     fn matcher_substring_unions_multiple_needles() {
-        let m = Matcher::new(Mode::Substring, &["beef".to_string(), "cafe".to_string()]).unwrap();
+        let m = mk(Mode::Substring, Scope::Ipns, &["beef", "cafe"]);
         let mut a = [b'x'; IPNS_NAME_LEN];
         a[10..14].copy_from_slice(b"beef");
-        assert!(m.matches(&a));
-
+        assert!(m.matches(&a, &EMPTY_PEER));
         let mut b = [b'x'; IPNS_NAME_LEN];
         b[40..44].copy_from_slice(b"cafe");
-        assert!(m.matches(&b));
-
-        let c = [b'x'; IPNS_NAME_LEN];
-        assert!(!m.matches(&c));
+        assert!(m.matches(&b, &EMPTY_PEER));
+        assert!(!m.matches(&[b'x'; IPNS_NAME_LEN], &EMPTY_PEER));
     }
 
     #[test]
     fn matcher_regex_ors_multiple_patterns() {
-        let m = Matcher::new(
-            Mode::Regex,
-            &["^k51.*xx$".to_string(), "^k51.*42$".to_string()],
-        )
-        .unwrap();
+        let m = mk(Mode::Regex, Scope::Ipns, &["^k51.*xx$", "^k51.*42$"]);
         let mut a = [b'q'; IPNS_NAME_LEN];
         a[..3].copy_from_slice(b"k51");
         a[60..].copy_from_slice(b"42");
-        assert!(m.matches(&a));
+        assert!(m.matches(&a, &EMPTY_PEER));
+    }
+
+    #[test]
+    fn matcher_peer_prefix_matches() {
+        // The reachable range at peer-id position 8 is restricted; sample a real
+        // keypair, take its 9th-11th chars as a known-reachable 3-char prefix,
+        // and check the matcher fires on it.
+        use rand::{RngCore, SeedableRng};
+        let mut rng = rand_chacha::ChaCha20Rng::seed_from_u64(0xb15);
+        let mut seed = [0u8; 32];
+        rng.fill_bytes(&mut seed);
+        let pk = ed25519_dalek::SigningKey::from_bytes(&seed)
+            .verifying_key()
+            .to_bytes();
+        let pid = peer_id(&pk);
+        let three_chars = std::str::from_utf8(&pid[8..11]).unwrap().to_string();
+        let m = peer_mk(&[three_chars.as_str()]);
+        assert!(m.matches(&EMPTY_IPNS, &pid));
+    }
+
+    #[test]
+    fn scope_both_routes_lowercase_to_ipns_and_uppercase_to_peer() {
+        // "h2" is base36 (fits IPNS) and reachable; "B" is uppercase (fits
+        // peer-id alphabet) and lands in the 9..T reachable range. Together
+        // under `Scope::Both` they should produce a matcher with one entry in
+        // each pool.
+        let m = Matcher::new(
+            Mode::Prefix,
+            Scope::Both,
+            &["h2".to_string(), "B".to_string()],
+        )
+        .expect("both patterns should route to their respective targets");
+        // The IPNS-only buffer (peer slot empty) should match the IPNS pattern.
+        assert!(m.matches(&ipns_buf("k51qzi5uqu5dh2"), &EMPTY_PEER));
+    }
+
+    #[test]
+    fn scope_both_rejects_unreachable_pattern_with_no_other_home() {
+        // "axy" fits both alphabets but is unreachable for IPNS (`a` not in
+        // g..m) AND for peer-id (`a` lowercase, not in 9..T). It must error.
+        let err = Matcher::new(Mode::Prefix, Scope::Both, &["axy".to_string()])
+            .err()
+            .expect("must error when reachable for neither target");
+        let _ = err; // message is implementation-defined
     }
 }

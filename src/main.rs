@@ -2,6 +2,7 @@ mod cpu;
 mod gpu;
 mod ipns;
 mod matcher;
+mod peerid;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -12,7 +13,7 @@ use clap::Parser;
 use crossbeam_channel::unbounded;
 
 use crate::cpu::Match;
-use crate::matcher::{Matcher, Mode};
+use crate::matcher::{Matcher, Mode, Scope};
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 enum Backend {
@@ -41,12 +42,23 @@ enum Backend {
         g..m are reachable as the first variable position."
 )]
 struct Args {
-    /// One or more patterns to search for; a match against any of them counts
-    /// as a hit. Base36 lowercase (0-9, a-z) for prefix and substring modes;
-    /// arbitrary regexes for regex mode. Prefix mode also accepts `[abc]` or
-    /// `[a-z]` character classes at any position inside a pattern.
+    /// One or more patterns to search for. A match against any pattern counts
+    /// as a hit. Patterns are interpreted according to `--target` (and `--mode`).
+    /// Prefix mode also accepts `[abc]` or `[a-z]` character classes at any
+    /// position inside a pattern.
     #[arg(required = true, num_args = 1..)]
     patterns: Vec<String>,
+
+    /// Which identifier to search.
+    ///
+    /// * `ipns` (default) — search the base36 IPNS name (`k51qzi5uqu5d…`).
+    /// * `peerid` — search the base58btc peer ID (`12D3KooW…`).
+    /// * `both` — search both at the same time. Patterns are auto-routed by
+    ///   their alphabet: lowercase / digits go to the IPNS pool, the others
+    ///   (uppercase or base58 digits) go to peer-id. A pattern that fits both
+    ///   alphabets is tried as both.
+    #[arg(short, long, value_enum, default_value_t = Scope::Ipns)]
+    target: Scope,
 
     /// Match mode.
     #[arg(short, long, value_enum, default_value_t = Mode::Prefix)]
@@ -79,7 +91,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let matcher = Arc::new(Matcher::new(args.mode, &args.patterns)?);
+    let matcher = Arc::new(Matcher::new(args.mode, args.target, &args.patterns)?);
     let stop = Arc::new(AtomicBool::new(false));
     let counter = Arc::new(AtomicU64::new(0));
     let (tx, rx) = unbounded::<Match>();
@@ -111,10 +123,11 @@ fn main() -> Result<()> {
     };
     eprintln!("[ipns-vanity] backend: {chosen:?}");
     eprintln!(
-        "[ipns-vanity] pattern{}: {} ({:?})",
+        "[ipns-vanity] target: {:?}  mode: {:?}  pattern{}: {}",
+        args.target,
+        args.mode,
         if args.patterns.len() == 1 { "" } else { "s" },
         args.patterns.join(" | "),
-        args.mode,
     );
 
     // Stats reporter thread.
@@ -194,9 +207,12 @@ enum ChosenBackend {
 
 fn report_match(m: &Match, idx: usize, elapsed: Duration) {
     let name = std::str::from_utf8(&m.name).unwrap_or("<non-utf8>");
+    let peer_id_bytes = peerid::peer_id(&m.pubkey);
+    let peer_id = std::str::from_utf8(&peer_id_bytes).unwrap_or("<non-utf8>");
     let protobuf_hex = libp2p_privkey_hex(&m.seed, &m.pubkey);
     println!("\n[match #{idx}] elapsed {:>5.1}s", elapsed.as_secs_f64());
-    println!("  name:    {name}");
+    println!("  ipns:    {name}");
+    println!("  peer:    {peer_id}");
     println!("  seed:    {}", hex::encode(m.seed));
     println!("  pubkey:  {}", hex::encode(m.pubkey));
     println!();

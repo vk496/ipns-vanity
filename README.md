@@ -1,6 +1,6 @@
 # ipns-vanity
 
-Find Ed25519 keypairs whose [IPNS](https://docs.ipfs.tech/concepts/ipns/) name starts with — or contains — a string you choose. Runs on the GPU through OpenCL with a multi-threaded CPU fallback, and prints a ready-to-paste `ipfs key import` command for every match.
+Find Ed25519 keypairs whose [IPNS](https://docs.ipfs.tech/concepts/ipns/) name **or** [libp2p peer ID](https://github.com/libp2p/specs/blob/master/peer-ids/peer-ids.md) starts with — or contains — a string you choose. Runs on the GPU through OpenCL with a multi-threaded CPU fallback, and prints a ready-to-paste `ipfs key import` command for every match.
 
 ```
 $ ipns-vanity -b gpu '[g-m]vk4'
@@ -22,9 +22,14 @@ $ ipns-vanity -b gpu '[g-m]vk4'
 
 ## What it does
 
-An IPNS name for an Ed25519 key is a CIDv1 with the `libp2p-key` codec, identity multihash and base36 (lowercase) multibase encoding. Every such name begins with the fixed 12-character string `k51qzi5uqu5d` (those bytes are the CIDv1 header — they can't be changed by picking a different key), and only the **62-character tail** varies.
+An Ed25519 key has two common public identifiers, both derived from the same 32-byte public key:
 
-`ipns-vanity` brute-forces random seeds, derives their public keys, encodes them as IPNS names, and prints any that match your pattern.
+| Identifier | Format                          | Example                                                        | Fixed prefix     |
+|------------|---------------------------------|----------------------------------------------------------------|------------------|
+| IPNS name  | base36 multibase of CIDv1       | `k51qzi5uqu5d…` (62 chars)                                     | `k51qzi5uqu5d`   |
+| Peer ID    | base58btc of identity multihash | `12D3KooW…` (52 chars)                                         | `12D3KooW`       |
+
+`ipns-vanity` brute-forces random seeds, derives their public keys, encodes them as IPNS names **and/or** peer IDs, and prints any that match your patterns. By default only the IPNS name is searched; choose with `--target ipns | peerid | both`.
 
 ## Install
 
@@ -68,6 +73,11 @@ ipns-vanity -n 5 gvk4
 # Multiple patterns — any match wins, which multiplies your odds.
 ipns-vanity gvk4 hvi6 jvk2
 ipns-vanity -m substring beef cafe d00d
+
+# Vanity peer ID instead of (or in addition to) IPNS.
+ipns-vanity -t peerid Satoshi               # peer ID starts with 12D3KooWSatoshi
+ipns-vanity -t both gvk4 Bh                 # any IPNS- or peer-prefix hit wins
+ipns-vanity -t both Foo Bar                 # patterns auto-routed by alphabet
 ```
 
 ## Pattern modes
@@ -78,31 +88,59 @@ ipns-vanity -m substring beef cafe d00d
 | `substring`  | Anywhere inside the 62-character name                        | CPU + GPU          |
 | `regex`      | A regex against the full name (incl. the `k51qzi5uqu5d`)     | CPU only           |
 
-All patterns must use base36 lowercase (digits and `a`–`z`). Regex is unrestricted but only runs on CPU.
+IPNS patterns use base36 lowercase (digits and `a`–`z`). Peer-ID patterns use base58btc (digits, upper- and lower-case letters minus `0`, `O`, `I`, `l`). Regex is unrestricted but only runs on CPU.
 
 ### Multiple patterns
 
 You can pass any number of patterns and a match against **any** of them counts as a hit. The kernel tests them all in parallel, so widening the search this way is essentially free and multiplies your effective odds.
 
 ```sh
-ipns-vanity gvk4 hvi6 mvk2           # any of the three prefixes
+ipns-vanity gvk4 hvi6 mvk2           # any of the three IPNS prefixes
 ipns-vanity -m substring beef cafe    # either substring anywhere
 ipns-vanity -m regex 'aa$' '42$'      # OR-combined into one regex
 ```
 
+### Selecting the target
+
+`--target / -t` picks which identifier(s) the patterns apply to:
+
+| Target          | Behaviour                                                                                                |
+|-----------------|----------------------------------------------------------------------------------------------------------|
+| `ipns` (default)| Patterns match the base36 IPNS name (`k51qzi5uqu5d…`).                                                  |
+| `peerid`        | Patterns match the base58btc peer ID (`12D3KooW…`).                                                     |
+| `both`          | Each pattern is **auto-routed** by its alphabet — lowercase / digits go to IPNS, uppercase letters and base58 digits to peer-id. Patterns that fit both alphabets are tried as both; ones that fit neither are rejected. |
+
+```sh
+ipns-vanity hvk                    # IPNS only (default)
+ipns-vanity -t peerid Sat Eve Bob  # peer-id only, three prefixes
+ipns-vanity -t both hvk Bh         # IPNS hvk OR peer-id Bh
+```
+
+A peer ID's identity-multihash bytes are literally a sub-range of the CID bytes (`cid[2..40]`), so the GPU kernel does the comparison via its existing range comparator with no extra encoder work — adding `--target both` is essentially free on the GPU.
+
+Caveats:
+- **GPU substring + peer-id**: not yet supported (no base58 encoder in the kernel). Use `--backend cpu` for that combo.
+- The fixed prefix for peer IDs is `12D3KooW` and the 9th character is restricted to `9`–`T` (analogous to the IPNS `g`–`m` restriction). Unreachable patterns are detected and reported up-front.
+
 ### The reachable-alphabet caveat
 
-The 13th character (right after `k51qzi5uqu5d`) is variable, but the 2²⁵⁶ pubkey range only covers about 18 % of one base36-digit slot at that position, so only **`g` through `m`** are actually reachable there.
+The character right after the fixed prefix is variable but its alphabet is restricted, because the 32-byte public-key range only covers a fraction of one base-36/58 digit slot at that position:
+
+- **IPNS** (`k51qzi5uqu5d` + …): only `g` through `m` are reachable.
+- **Peer ID** (`12D3KooW` + …): only `9` through `T` are reachable.
 
 `ipns-vanity` checks this up front:
 
 ```
 $ ipns-vanity 1abc
-Error: prefix 'k51qzi5uqu5d1abc' is not achievable: at name position 12
+Error: ipns prefix 'k51qzi5uqu5d1abc' is not achievable: at position 12
 the character must be between 'g' and 'm' (saw '1').
-Ed25519 IPNS names are bounded by:
-  k51qzi5uqu5dg6l7sg2ssb5uefnq8g7g1d6n6j2zsio0o0k7snyb11p8myhxxc
-  k51qzi5uqu5dmkadisduutrwhobhcd351viuwscvsltkaymqovgho5slq61rlr
+…
+
+$ ipns-vanity --peer-id zzz
+Error: peer-id prefix '12D3KooWzzz' is not achievable: at position 8
+the character must be between '9' and 'T' (saw 'z').
+…
 ```
 
 ### Character classes (prefix mode)
@@ -116,6 +154,21 @@ ipns-vanity '[g-m]vk4[6a3]'  # 21 combinations: g..m × 6/a/3
 ```
 
 The host expands the pattern into a Cartesian product, drops any unreachable variants (e.g. anything starting outside `g..m`), then ships the resulting list of CID byte-ranges to the kernel. The kernel OR-tests them, so widening rarely costs anything measurable — and on the search side it directly multiplies your odds of a hit. There's a 1024-variant cap to catch runaway patterns.
+
+## Output
+
+Each match shows both identifiers plus the seed/pubkey hex and a paste-ready import command:
+
+```
+[match #1] elapsed   0.2s
+  ipns:    k51qzi5uqu5dgvqvp9bm7k2l6ih0zj6r93x0nmvr90i5i86ycseij1r6szsv5f
+  peer:    12D3KooWBhpApNFqmiBEKv1QYuJTioqqzbNCE9mSuxjnjrKTJiYa
+  seed:    8b4f1a1b68dcc993be5b68083c4dfd15f76ae9997cb7ce1073377bce77a858f5
+  pubkey:  1c09b5395e59a64b9507b9a994d2c050202bfa60c78d55d1f8d4f77553f79fb3
+
+  import into IPFS (libp2p-protobuf format):
+    echo 080112408b4f1a1b…f79fb3 | xxd -r -p | ipfs key import <NAME> -
+```
 
 ## Importing the key into IPFS
 

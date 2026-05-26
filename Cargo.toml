@@ -26,6 +26,9 @@ ocl = "0.19"
 ctrlc = "3.4"
 hex = "0.4"
 
+[dependencies.bs58]
+version = "0.5"
+
 [dev-dependencies]
 multibase = "0.9"
 

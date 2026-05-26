@@ -109,14 +109,26 @@ pub fn run(
     // mode 0 = prefix (one or more CID ranges OR'd),
     // mode 1 = substring (one or more needles OR'd).
     //
+    // Peer-ID prefixes are turned into CID ranges too: a peer-ID multihash is
+    // exactly `cid[2..40]`, so we keep the kernel's existing range comparator
+    // by prefixing the multihash range with `[0x01, 0x72]` (the constant CIDv1
+    // bytes).
+    //
     // The kernel receives concatenated needles in `needle_data` plus a
     // parallel `needle_lens` array; for prefix mode those buffers stay empty.
+    // Peer-ID substrings/regex aren't supported on the GPU yet — they require
+    // base58btc encoding inside the kernel — so we fall back to CPU.
     let (mode_code, cid_lo, cid_hi, needle_data, needle_lens, n_ranges) = match &*matcher {
-        Matcher::Prefix(ps) => {
-            let mut lo_all = Vec::with_capacity(ps.len() * 40);
-            let mut hi_all = Vec::with_capacity(ps.len() * 40);
-            for p in ps {
+        Matcher::Prefix { ipns, peer } => {
+            let mut lo_all = Vec::with_capacity((ipns.len() + peer.len()) * 40);
+            let mut hi_all = Vec::with_capacity((ipns.len() + peer.len()) * 40);
+            for p in ipns {
                 let (lo, hi) = prefix_to_cid_range(p)?;
+                lo_all.extend_from_slice(&lo);
+                hi_all.extend_from_slice(&hi);
+            }
+            for p in peer {
+                let (lo, hi) = peer_prefix_to_cid_range(p)?;
                 lo_all.extend_from_slice(&lo);
                 hi_all.extend_from_slice(&hi);
             }
@@ -126,14 +138,19 @@ pub fn run(
                 hi_all,
                 Vec::new(),
                 Vec::new(),
-                ps.len() as u32,
+                (ipns.len() + peer.len()) as u32,
             )
         }
-        Matcher::Substring(_) => {
-            let needles = matcher.as_substrings().unwrap();
+        Matcher::Substring { ipns, peer } => {
+            if !peer.is_empty() {
+                bail!(
+                    "peer-id substring patterns aren't supported by the GPU backend; \
+                     rerun with --backend cpu"
+                );
+            }
             let mut data = Vec::new();
-            let mut lens: Vec<u32> = Vec::with_capacity(needles.len());
-            for n in needles {
+            let mut lens: Vec<u32> = Vec::with_capacity(ipns.needles.len());
+            for n in &ipns.needles {
                 if n.is_empty() || n.len() > 62 {
                     bail!("each substring needle must be between 1 and 62 base36 chars");
                 }
@@ -146,10 +163,10 @@ pub fn run(
                 vec![0u8; 40],
                 data,
                 lens,
-                needles.len() as u32,
+                ipns.needles.len() as u32,
             )
         }
-        Matcher::Regex(_) => {
+        Matcher::Regex { .. } => {
             bail!("regex mode is not supported by the GPU backend; rerun with --backend cpu");
         }
     };
@@ -275,7 +292,8 @@ pub fn run(
             if cpu_pubkey == result_pubkey {
                 let mut name_arr = [0u8; IPNS_NAME_LEN];
                 name_arr.copy_from_slice(&ipns_name(&cpu_pubkey));
-                if matcher.matches(&name_arr) {
+                let peer = crate::peerid::peer_id(&cpu_pubkey);
+                if matcher.matches(&name_arr, &peer) {
                     let _ = tx.send(Match {
                         seed: result_seed,
                         pubkey: cpu_pubkey,
@@ -499,6 +517,158 @@ fn base36_decode(c: u8) -> Result<u32> {
         b'a'..=b'z' => Ok(10 + (c - b'a') as u32),
         _ => Err(anyhow!("non-base36 char in pattern: '{}'", c as char)),
     }
+}
+
+const BASE58_ALPHABET: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+fn base58_decode(c: u8) -> Result<u32> {
+    let idx = BASE58_ALPHABET
+        .iter()
+        .position(|&b| b == c)
+        .ok_or_else(|| anyhow!("non-base58btc char in peer-id pattern: '{}'", c as char))?;
+    Ok(idx as u32)
+}
+
+/// Translate a peer-ID prefix into a 40-byte big-endian CID range so the
+/// kernel's existing range comparator can match it.
+///
+/// A peer ID is `base58btc(identity_multihash(protobuf_pubkey))` — 52 ASCII
+/// chars. The multihash itself is exactly `cid[2..40]` (the CIDv1 prefix
+/// `[0x01, 0x72]` lives at `cid[0..2]`). So we decode the user's peer-ID
+/// prefix into a 38-byte multihash byte range and then prepend `[0x01, 0x72]`
+/// to get a 40-byte CID range. The kernel does the comparison exactly as it
+/// does for IPNS prefixes.
+fn peer_prefix_to_cid_range(prefix_bytes: &[u8]) -> Result<([u8; 40], [u8; 40])> {
+    use crate::peerid::{FIXED_PEER_PREFIX, PEER_ID_LEN};
+
+    if prefix_bytes.len() < FIXED_PEER_PREFIX.len()
+        || &prefix_bytes[..FIXED_PEER_PREFIX.len()] != FIXED_PEER_PREFIX
+    {
+        bail!(
+            "internal: peer-id prefix does not start with the fixed '{}' bytes",
+            std::str::from_utf8(FIXED_PEER_PREFIX).unwrap()
+        );
+    }
+    if prefix_bytes.len() > PEER_ID_LEN {
+        bail!("peer-id prefix is longer than a peer ID ({})", PEER_ID_LEN);
+    }
+
+    // base58btc treats each leading '1' as one leading 0x00 byte in the
+    // decoded output. Count those and drop them from the digit stream we'll
+    // multiply through.
+    let leading_ones = prefix_bytes.iter().take_while(|&&c| c == b'1').count();
+    let digit_bytes = &prefix_bytes[leading_ones..];
+
+    let mh_len = 38usize;
+    let prefix_value_bytes = leading_ones;
+    let prefix_digit_count = digit_bytes.len();
+    let total_digit_slots = mh_len - prefix_value_bytes; // bytes available below the leading zeros
+
+    // Decode the (non-leading-zero) prefix base58 digits as a big integer.
+    let mut value = [0u32; 13];
+    for &c in digit_bytes {
+        let digit = base58_decode(c)? as u64;
+        let mut carry = digit;
+        for limb in value.iter_mut() {
+            let v = (*limb as u64) * 58 + carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        if carry != 0 {
+            bail!("peer-id prefix value overflowed the multihash");
+        }
+    }
+
+    // Bound the variable tail as a base58 integer: 58^(total_digit_slots
+    // worth of digits - prefix_digit_count digits already consumed).
+    //
+    // Working in base58 over `mh_len - leading_ones` bytes gives a value range
+    // of `[0, 256^(mh_len - leading_ones))`. The user pinned the most-
+    // significant `prefix_digit_count` base58 digits, so the tail spans
+    // `[0, 58^(D - prefix_digit_count))` where D is the total digit count for
+    // a value of that byte width.
+    //
+    // We compute D by counting how many base58 digits a full
+    // `256^(mh_len - leading_ones)`-magnitude value needs — this is `ceil`,
+    // which for our sizes (37 bytes ⇒ 51 digits) is one more than
+    // `floor(log_58(256^bytes))`.
+    let d = base58_digits_for_bytes(total_digit_slots);
+    if prefix_digit_count > d {
+        bail!("peer-id prefix is longer than a peer ID");
+    }
+    let tail_digits = d - prefix_digit_count;
+
+    // value · 58^tail_digits is the lower bound of the multihash value (less
+    // its leading zero bytes); +1·58^tail_digits gives the exclusive upper.
+    let multiplier = pow58_limbs(tail_digits);
+    let lo_full = mul_limbs(&value, &multiplier);
+    let hi_full = add_limbs(&lo_full, &multiplier);
+
+    // Pack into a 38-byte big-endian buffer (the multihash value below the
+    // leading zeros). Limb 0 is the least-significant 32 bits.
+    let mut mh = [0u8; 40]; // 2-byte CIDv1 header + 38-byte multihash
+    mh[0] = 0x01;
+    mh[1] = 0x72;
+    pack_be_into(&mut mh[2 + leading_ones..40], &lo_full)?;
+
+    let mut hi = [0u8; 40];
+    hi[0] = 0x01;
+    hi[1] = 0x72;
+    // For the upper bound the leading-zero prefix can be exceeded by exactly
+    // one (carry into the byte above), so pack into a 1-byte-longer slot if
+    // there's room. We just pack into the same window and rely on add_limbs
+    // not overflowing past mh_len bits in practice.
+    pack_be_into(&mut hi[2 + leading_ones..40], &hi_full)?;
+
+    Ok((mh, hi))
+}
+
+/// Number of base58 digits needed to represent any value in `[0, 256^bytes)`.
+/// `ceil(bytes · log_58(256))`.
+fn base58_digits_for_bytes(bytes: usize) -> usize {
+    if bytes == 0 {
+        return 0;
+    }
+    // log_58(256) ≈ 1.365658 — close enough for the modest sizes we hit.
+    let log_ratio = (256f64).ln() / (58f64).ln();
+    (bytes as f64 * log_ratio).ceil() as usize
+}
+
+fn pow58_limbs(n: usize) -> [u32; 13] {
+    let mut out = [0u32; 13];
+    out[0] = 1;
+    for _ in 0..n {
+        let mut carry = 0u64;
+        for limb in out.iter_mut() {
+            let v = (*limb as u64) * 58 + carry;
+            *limb = v as u32;
+            carry = v >> 32;
+        }
+        debug_assert_eq!(carry, 0, "pow58 overflow");
+    }
+    out
+}
+
+/// Pack the value held in `limbs` (little-endian 32-bit) into the given
+/// big-endian byte slice, error if it doesn't fit.
+fn pack_be_into(dst: &mut [u8], limbs: &[u32; 13]) -> Result<()> {
+    let cap = dst.len();
+    // Check the high limbs are zero past the slot.
+    for (i, &limb) in limbs.iter().enumerate() {
+        for byte_idx in 0..4 {
+            let global_byte = i * 4 + byte_idx;
+            if global_byte >= cap && ((limb >> (8 * byte_idx)) & 0xff) != 0 {
+                bail!("peer-id prefix value doesn't fit in 38 bytes");
+            }
+        }
+    }
+    // Write big-endian.
+    for (byte_pos, slot) in dst.iter_mut().enumerate() {
+        let global_byte = cap - 1 - byte_pos;
+        let limb = limbs[global_byte / 4];
+        *slot = ((limb >> (8 * (global_byte % 4))) & 0xff) as u8;
+    }
+    Ok(())
 }
 
 /// 36^n as a little-endian u32 limb array (13 limbs ≈ 416 bits — plenty).
