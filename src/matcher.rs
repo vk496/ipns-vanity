@@ -78,9 +78,12 @@ impl Target {
 
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum Mode {
-    /// Match the user pattern immediately after the constant `k51qzi5uqu5d` prefix.
+    /// Match the user pattern immediately after the constant `k51qzi5uqu5d`
+    /// (or `12D3KooW` for peer IDs) prefix.
     Prefix,
-    /// Match the user pattern anywhere inside the IPNS name.
+    /// Match the user pattern at the very end of the IPNS name / peer ID.
+    Suffix,
+    /// Match the user pattern anywhere inside the IPNS name / peer ID.
     Substring,
     /// Treat the pattern as a regular expression applied to the full name bytes.
     Regex,
@@ -102,6 +105,11 @@ pub enum Matcher {
     /// ones to CID ranges and the peer-ID ones to multihash ranges (re-cast as
     /// CID ranges, see `gpu::run`).
     Prefix {
+        ipns: Vec<Vec<u8>>,
+        peer: Vec<Vec<u8>>,
+    },
+    /// Suffix needles per target (matched via `ends_with`).
+    Suffix {
         ipns: Vec<Vec<u8>>,
         peer: Vec<Vec<u8>>,
     },
@@ -151,6 +159,10 @@ impl Matcher {
                 }
                 Ok(Self::Prefix { ipns, peer })
             }
+            Mode::Suffix => Ok(Self::Suffix {
+                ipns: build_suffixes(Target::Ipns, &ipns_pats)?,
+                peer: build_suffixes(Target::Peer, &peer_pats)?,
+            }),
             Mode::Substring => Ok(Self::Substring {
                 ipns: build_substrings(Target::Ipns, &ipns_pats)?,
                 peer: build_substrings(Target::Peer, &peer_pats)?,
@@ -169,6 +181,10 @@ impl Matcher {
                 i.iter().any(|x| ipns.starts_with(x.as_slice()))
                     || p.iter().any(|x| peer.starts_with(x.as_slice()))
             }
+            Self::Suffix { ipns: i, peer: p } => {
+                i.iter().any(|x| ipns.ends_with(x.as_slice()))
+                    || p.iter().any(|x| peer.ends_with(x.as_slice()))
+            }
             Self::Substring { ipns: i, peer: p } => {
                 i.finders.iter().any(|f| f.find(ipns).is_some())
                     || p.finders.iter().any(|f| f.find(peer).is_some())
@@ -186,6 +202,7 @@ impl Matcher {
     pub fn needs_peer_id(&self) -> bool {
         match self {
             Self::Prefix { peer, .. } => !peer.is_empty(),
+            Self::Suffix { peer, .. } => !peer.is_empty(),
             Self::Substring { peer, .. } => !peer.is_empty(),
             Self::Regex { peer, .. } => peer.is_some(),
         }
@@ -329,6 +346,15 @@ fn build_prefix_variants(target: Target, patterns: &[String]) -> Result<Vec<Vec<
         );
     }
     Ok(reachable)
+}
+
+fn build_suffixes(target: Target, patterns: &[String]) -> Result<Vec<Vec<u8>>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(patterns.len());
+    for pat in patterns {
+        ensure_alphabet(target, pat)?;
+        out.push(pat.as_bytes().to_vec());
+    }
+    Ok(out)
 }
 
 fn build_substrings(target: Target, patterns: &[String]) -> Result<Substrings> {
@@ -652,6 +678,30 @@ mod tests {
         name[..3].copy_from_slice(b"k51");
         name[60..].copy_from_slice(b"42");
         assert!(m.matches(&name, &EMPTY_PEER));
+    }
+
+    #[test]
+    fn matcher_suffix_matches_end() {
+        let m = mk(Mode::Suffix, Scope::Ipns, &["abc"]);
+        let mut name = [b'x'; IPNS_NAME_LEN];
+        name[IPNS_NAME_LEN - 3..].copy_from_slice(b"abc");
+        assert!(m.matches(&name, &EMPTY_PEER));
+        // Same bytes but not at the end → no match.
+        let mut name = [b'x'; IPNS_NAME_LEN];
+        name[10..13].copy_from_slice(b"abc");
+        assert!(!m.matches(&name, &EMPTY_PEER));
+    }
+
+    #[test]
+    fn matcher_suffix_unions_multiple_needles() {
+        let m = mk(Mode::Suffix, Scope::Ipns, &["end1", "end2"]);
+        let mut a = [b'x'; IPNS_NAME_LEN];
+        a[IPNS_NAME_LEN - 4..].copy_from_slice(b"end1");
+        assert!(m.matches(&a, &EMPTY_PEER));
+        let mut b = [b'x'; IPNS_NAME_LEN];
+        b[IPNS_NAME_LEN - 4..].copy_from_slice(b"end2");
+        assert!(m.matches(&b, &EMPTY_PEER));
+        assert!(!m.matches(&[b'x'; IPNS_NAME_LEN], &EMPTY_PEER));
     }
 
     #[test]

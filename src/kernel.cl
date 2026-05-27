@@ -414,11 +414,12 @@ static void cid_to_base36(uchar out[61], const uchar cid[40]) {
 // Mode codes match `gpu::Mode` on the host side.
 #define MODE_PREFIX    0u
 #define MODE_SUBSTRING 1u
+#define MODE_SUFFIX    2u
 
 __kernel void search(
     __global const uchar* base_seed,        // 32 bytes
     ulong  nonce_offset,                    // unique per dispatch
-    uint   mode,                            // MODE_PREFIX or MODE_SUBSTRING
+    uint   mode,                            // MODE_PREFIX / MODE_SUBSTRING / MODE_SUFFIX
     __global const uchar* cid_lo,           // n_ranges × 40 bytes (prefix mode)
     __global const uchar* cid_hi,           // n_ranges × 40 bytes (prefix mode)
     uint   n_ranges,                        // number of (lo, hi) pairs
@@ -458,17 +459,18 @@ __kernel void search(
                 break;
             }
         }
-    } else { // MODE_SUBSTRING
+    } else { // MODE_SUBSTRING or MODE_SUFFIX — both need the base36 form.
         uchar name62[62];
         name62[0] = 'k';
         cid_to_base36(name62 + 1, cid);
 
-        // Iterate the concatenated needles; any match wins.
         uint offset = 0;
         for (uint nidx = 0; nidx < n_needles && !hit; nidx++) {
             uint len = needle_lens[nidx];
             if (len > 0 && len <= 62) {
-                for (uint start = 0; start + len <= 62; start++) {
+                if (mode == MODE_SUFFIX) {
+                    // Single end-of-name comparison.
+                    uint start = 62 - len;
                     int match = 1;
                     for (uint k = 0; k < len; k++) {
                         if (name62[start + k] != needle_data[offset + k]) {
@@ -476,7 +478,19 @@ __kernel void search(
                             break;
                         }
                     }
-                    if (match) { hit = 1; break; }
+                    if (match) hit = 1;
+                } else {
+                    // Sliding-window substring search.
+                    for (uint start = 0; start + len <= 62; start++) {
+                        int match = 1;
+                        for (uint k = 0; k < len; k++) {
+                            if (name62[start + k] != needle_data[offset + k]) {
+                                match = 0;
+                                break;
+                            }
+                        }
+                        if (match) { hit = 1; break; }
+                    }
                 }
             }
             offset += len;

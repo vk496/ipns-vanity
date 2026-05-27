@@ -166,6 +166,31 @@ pub fn run(
                 ipns.needles.len() as u32,
             )
         }
+        Matcher::Suffix { ipns, peer } => {
+            if !peer.is_empty() {
+                bail!(
+                    "peer-id suffix patterns aren't supported by the GPU backend; \
+                     rerun with --backend cpu"
+                );
+            }
+            let mut data = Vec::new();
+            let mut lens: Vec<u32> = Vec::with_capacity(ipns.len());
+            for n in ipns {
+                if n.is_empty() || n.len() > 62 {
+                    bail!("each suffix needle must be between 1 and 62 base36 chars");
+                }
+                data.extend_from_slice(n);
+                lens.push(n.len() as u32);
+            }
+            (
+                2u32,
+                vec![0u8; 40],
+                vec![0u8; 40],
+                data,
+                lens,
+                ipns.len() as u32,
+            )
+        }
         Matcher::Regex { .. } => {
             bail!("regex mode is not supported by the GPU backend; rerun with --backend cpu");
         }

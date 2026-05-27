@@ -64,6 +64,9 @@ ipns-vanity -b cpu gvk4
 # Substring instead of prefix.
 ipns-vanity -m substring beef
 
+# Suffix — match the very end of the name.
+ipns-vanity -m suffix abc
+
 # Regex (CPU only).
 ipns-vanity -m regex '^k51qzi5uqu5dh.*42$'
 
@@ -82,11 +85,14 @@ ipns-vanity -t both Foo Bar                 # patterns auto-routed by alphabet
 
 ## Pattern modes
 
-| Mode (`-m`)  | What it matches                                              | Backend            |
-|--------------|--------------------------------------------------------------|--------------------|
-| `prefix`     | Right after the constant `k51qzi5uqu5d`                      | CPU + GPU          |
-| `substring`  | Anywhere inside the 62-character name                        | CPU + GPU          |
-| `regex`      | A regex against the full name (incl. the `k51qzi5uqu5d`)     | CPU only           |
+| Mode (`-m`)  | What it matches                                                  | Backend            |
+|--------------|------------------------------------------------------------------|--------------------|
+| `prefix`     | Right after the constant `k51qzi5uqu5d` (or `12D3KooW`)          | CPU + GPU          |
+| `suffix`     | At the very end of the name / peer ID                            | CPU + GPU\*        |
+| `substring`  | Anywhere inside the 62-character name (52 for peer IDs)          | CPU + GPU\*        |
+| `regex`      | A regex against the full name / peer ID                          | CPU only           |
+
+\* GPU support covers the IPNS target. Peer-ID suffix and substring fall back to CPU (the kernel doesn't have a base58btc encoder).
 
 IPNS patterns use base36 lowercase (digits and `a`–`z`). Peer-ID patterns use base58btc (digits, upper- and lower-case letters minus `0`, `O`, `I`, `l`). Regex is unrestricted but only runs on CPU.
 
